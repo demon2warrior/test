@@ -31,7 +31,6 @@ class InstrumentState:
     
     def get_hash(self) -> str:
         """Generate a hash representing this instrument configuration"""
-        # Create a sorted representation of the instrument state
         state_str = ""
         for op in sorted(self.operators.keys()):
             for reg in sorted(self.operators[op].keys()):
@@ -60,27 +59,22 @@ class VGMInstrumentProcessor:
     def __init__(self):
         # YM2612 register mappings
         self.OPERATOR_REGS = {
-            # DT/MUL, TL, KS/AR, AM/DR, SR, SL/RR, SSG-EG
-            0x30: "DT_MUL", 0x40: "TL", 0x50: "KS_AR", 
+            0x30: "DT_MUL", 0x40: "TL", 0x50: "KS_AR",
             0x60: "AM_DR", 0x70: "SR", 0x80: "SL_RR", 0x90: "SSG_EG"
         }
-        
         self.CHANNEL_REGS = {
-            0xA0: "FREQ_LOW", 0xA4: "FREQ_HIGH", 
+            0xA0: "FREQ_LOW", 0xA4: "FREQ_HIGH",
             0xB0: "FB_ALG", 0xB4: "LR_AMS_FMS"
         }
-        
-        # Track instrument states for each channel
         self.channel_instruments: Dict[int, InstrumentState] = {}
         self.discovered_instruments: Dict[str, InstrumentState] = {}
         self.note_events: List[NoteEvent] = []
         self.dac_events: List[DACEvent] = []
-        self.discovered_dac_samples: Dict[str, List[int]] = {}  # sample_group -> [values]
+        self.discovered_dac_samples: Dict[str, List[int]] = {}
         self.current_time = 0
         self.dac_enabled = False
         self.debug = True  # Enable debug output
-        
-        # Initialize channel states
+
         for ch in range(6):
             self.channel_instruments[ch] = InstrumentState({}, {})
 
@@ -88,599 +82,334 @@ class VGMInstrumentProcessor:
         """Parse VGM file header"""
         if len(data) < 64 or data[:4] != b'Vgm ':
             raise ValueError("Invalid VGM file")
-        
-        header = {}
-        header['version'] = struct.unpack('<I', data[8:12])[0]
-        header['ym2612_clock'] = struct.unpack('<I', data[44:48])[0]
-        header['data_offset'] = struct.unpack('<I', data[52:56])[0]
-        header['data_start'] = header['data_offset'] + 52 if header['data_offset'] != 0 else 64
-        
+        header = {
+            'version':     struct.unpack('<I', data[8:12])[0],
+            'ym2612_clock':struct.unpack('<I', data[44:48])[0],
+            'data_offset': struct.unpack('<I', data[52:56])[0]
+        }
+        header['data_start'] = header['data_offset'] + 52 if header['data_offset'] else 64
         if self.debug:
             print(f"VGM Version: 0x{header['version']:08X}")
             print(f"YM2612 Clock: {header['ym2612_clock']}")
             print(f"Data starts at: {header['data_start']}")
-        
         return header
 
     def get_channel_from_port_reg(self, port: int, reg: int) -> Optional[int]:
         """Determine which channel a register write affects"""
-        if port == 0x52:  # Port 0 (channels 0-2)
-            if reg == 0x28:  # Key on/off affects all channels
-                return None  # Special case, handle separately
-            # Extract channel from register
-            if reg >= 0xA0:
-                channel = (reg - 0xA0) % 4
-                return channel if channel < 3 else None
-            else:
-                channel = reg & 0x03
-                return channel if channel < 3 else None
-        elif port == 0x53:  # Port 1 (channels 3-5)
-            if reg == 0x28:
-                return None
-            if reg >= 0xA0:
-                channel = ((reg - 0xA0) % 4) + 3
-                return channel if channel < 6 else None
-            else:
-                channel = (reg & 0x03) + 3
-                return channel if channel < 6 else None
+        if port == 0x52:
+            if reg == 0x28: return None
+            channel = ((reg - 0xA0) % 4) if reg >= 0xA0 else (reg & 0x03)
+            return channel if channel < 3 else None
+        elif port == 0x53:
+            if reg == 0x28: return None
+            channel = (((reg - 0xA0) % 4) + 3) if reg >= 0xA0 else ((reg & 0x03) + 3)
+            return channel if channel < 6 else None
         return None
 
     def get_operator_from_reg(self, reg: int) -> Optional[int]:
-        """Get operator number (0-3) from register"""
-        if reg < 0x30:
-            return None
-        base_reg = (reg & 0xF0)
-        if base_reg in self.OPERATOR_REGS:
+        if reg < 0x30: return None
+        base = reg & 0xF0
+        if base in self.OPERATOR_REGS:
             return (reg & 0x0C) >> 2
         return None
 
     def update_instrument_state(self, channel: int, reg: int, value: int, port: int):
-        """Update the instrument state for a channel"""
         if channel is None or channel < 0 or channel > 5:
             return
-        
-        instrument = self.channel_instruments[channel]
-        
-        # Handle operator registers
-        operator = self.get_operator_from_reg(reg)
-        if operator is not None:
-            base_reg = reg & 0xF0
-            if operator not in instrument.operators:
-                instrument.operators[operator] = {}
-            instrument.operators[operator][base_reg] = value
-            if self.debug and reg == 0x40:  # TL register - important for instrument identity
-                print(f"CH{channel} OP{operator} TL={value:02X}")
-        
-        # Handle channel registers
+        inst = self.channel_instruments[channel]
+        op = self.get_operator_from_reg(reg)
+        if op is not None:
+            base = reg & 0xF0
+            inst.operators.setdefault(op, {})[base] = value
+            if self.debug and reg == 0x40:
+                print(f"CH{channel} OP{op} TL={value:02X}")
         elif reg in self.CHANNEL_REGS:
-            instrument.channel_regs[reg] = value
-            if self.debug and reg == 0xB0:  # FB/ALG register
+            inst.channel_regs[reg] = value
+            if self.debug and reg == 0xB0:
                 print(f"CH{channel} FB/ALG={value:02X}")
 
     def handle_key_onoff(self, value: int):
-        """Handle key on/off register (0x28)"""
-        # YM2612 key on/off channel mapping:
-        # 0,1,2 = channels 0,1,2 (port 0)
-        # 4,5,6 = channels 3,4,5 (port 1) 
-        raw_channel = value & 0x07
-        
-        if raw_channel > 6 or raw_channel == 3 or raw_channel == 7:
-            return  # Invalid channel
-        
-        # Map to internal channel numbering (0-5)
-        if raw_channel <= 2:
-            channel = raw_channel
-        else:  # raw_channel >= 4
-            channel = raw_channel - 1  # 4,5,6 -> 3,4,5
-        
+        raw = value & 0x07
+        if raw > 6 or raw == 3: return
+        channel = raw if raw <= 2 else raw - 1
         key_on = (value & 0xF0) != 0
-        
         if self.debug:
-            print(f"Key {'ON' if key_on else 'OFF'} CH{channel} (raw={raw_channel:02X}) at time {self.current_time}")
-        
-        instrument = self.channel_instruments[channel]
-        
+            print(f"Key {'ON' if key_on else 'OFF'} CH{channel} at {self.current_time}")
+        inst = self.channel_instruments[channel]
         if key_on:
-            # Note on - capture current instrument state
-            instrument.active = True
-            instrument.last_note_time = self.current_time
-            
-            # Generate instrument hash and store if new
-            inst_hash = instrument.get_hash()
-            if inst_hash not in self.discovered_instruments:
-                # Deep copy the instrument state
-                new_inst = InstrumentState(
-                    operators={op: regs.copy() for op, regs in instrument.operators.items()},
-                    channel_regs=instrument.channel_regs.copy()
+            inst.active = True
+            inst.last_note_time = self.current_time
+            h = inst.get_hash()
+            if h not in self.discovered_instruments:
+                self.discovered_instruments[h] = InstrumentState(
+                    operators={o: r.copy() for o,r in inst.operators.items()},
+                    channel_regs=inst.channel_regs.copy()
                 )
-                self.discovered_instruments[inst_hash] = new_inst
-                if self.debug:
-                    print(f"New instrument discovered: {inst_hash}")
-            
-            # Record note event
+                if self.debug: print(f"New instrument: {h}")
             freq = self.get_current_frequency(channel)
-            self.note_events.append(NoteEvent(
-                time=self.current_time,
-                channel=channel,
-                note_on=True,
-                instrument_hash=inst_hash,
-                frequency=freq
-            ))
+            self.note_events.append(NoteEvent(self.current_time, channel, True, h, freq))
         else:
-            # Note off
-            if instrument.active:
-                inst_hash = instrument.get_hash()
-                self.note_events.append(NoteEvent(
-                    time=self.current_time,
-                    channel=channel,
-                    note_on=False,
-                    instrument_hash=inst_hash
-                ))
-            instrument.active = False
+            if inst.active:
+                h = inst.get_hash()
+                self.note_events.append(NoteEvent(self.current_time, channel, False, h))
+            inst.active = False
 
     def get_current_frequency(self, channel: int) -> Optional[int]:
-        """Get current frequency setting for a channel"""
-        instrument = self.channel_instruments[channel]
-        freq_low = instrument.channel_regs.get(0xA0, 0)
-        freq_high = instrument.channel_regs.get(0xA4, 0)
-        return (freq_high << 8) | freq_low if freq_low or freq_high else None
+        inst = self.channel_instruments[channel]
+        lo = inst.channel_regs.get(0xA0, 0)
+        hi = inst.channel_regs.get(0xA4, 0)
+        return (hi << 8) | lo if (lo or hi) else None
 
-    def group_dac_samples(self, sample_values: List[int], window_size: int = 10) -> str:
-        """Group similar DAC sample values together to identify instruments"""
-        if not sample_values:
-            return "empty"
-        
-        # For drum samples, group by value ranges or patterns
-        avg_value = sum(sample_values) / len(sample_values)
-        max_value = max(sample_values)
-        min_value = min(sample_values)
-        value_range = max_value - min_value
-        
-        # Create a signature based on characteristics
-        if value_range < 20:  # Low variation - might be a sustained sound
-            group_type = "sustained"
-        elif max_value > 200:  # High amplitude - likely kick or snare
-            group_type = "loud"
-        elif avg_value < 50:  # Low amplitude - likely hi-hat or cymbal
-            group_type = "quiet" 
-        else:
-            group_type = "mid"
-        
-        # Sub-categorize by average value ranges
-        avg_category = int(avg_value / 32)  # 0-7 categories
-        
-        return f"{group_type}_{avg_category:02d}"
+    def group_dac_samples(self, values: List[int], window_size: int = 10) -> str:
+        if not values: return "empty"
+        avg = sum(values)/len(values)
+        mx, mn = max(values), min(values)
+        rng = mx - mn
+        if rng < 20:   grp = "sustained"
+        elif mx > 200: grp = "loud"
+        elif avg < 50: grp = "quiet"
+        else:          grp = "mid"
+        cat = int(avg/32)
+        return f"{grp}_{cat:02d}"
 
     def handle_dac_sample(self, value: int):
-        """Handle DAC sample data"""
-        if not self.dac_enabled:
-            return
-            
-        # Track consecutive DAC samples to group them
-        if not hasattr(self, '_current_dac_sequence'):
-            self._current_dac_sequence = []
-            self._dac_sequence_start = self.current_time
-        
-        self._current_dac_sequence.append(value)
-        
-        # If we have a sequence of samples, group them
-        if len(self._current_dac_sequence) >= 5:  # Minimum sequence length
-            sample_group = self.group_dac_samples(self._current_dac_sequence)
-            
-            # Store the sample group
-            if sample_group not in self.discovered_dac_samples:
-                self.discovered_dac_samples[sample_group] = []
-            
-            # Record this DAC event
-            self.dac_events.append(DACEvent(
-                time=self._dac_sequence_start,
-                sample_value=value,
-                sample_group=sample_group
-            ))
-            
-            # Reset for next sequence
-            self._current_dac_sequence = []
+        if not self.dac_enabled: return
+        if not hasattr(self, '_dac_seq'):
+            self._dac_seq = []; self._dac_start = self.current_time
+        self._dac_seq.append(value)
+        if len(self._dac_seq) >= 5:
+            g = self.group_dac_samples(self._dac_seq)
+            self.discovered_dac_samples.setdefault(g, [])
+            self.dac_events.append(DACEvent(self._dac_start, value, g))
+            self._dac_seq = []
 
     def finalize_dac_sequence(self):
-        """Finalize any remaining DAC sequence"""
-        if hasattr(self, '_current_dac_sequence') and self._current_dac_sequence:
-            sample_group = self.group_dac_samples(self._current_dac_sequence)
-            if sample_group not in self.discovered_dac_samples:
-                self.discovered_dac_samples[sample_group] = []
-            
-            self.dac_events.append(DACEvent(
-                time=self._dac_sequence_start,
-                sample_value=self._current_dac_sequence[-1],
-                sample_group=sample_group
-            ))
-            self._current_dac_sequence = []
+        if hasattr(self, '_dac_seq') and self._dac_seq:
+            g = self.group_dac_samples(self._dac_seq)
+            self.discovered_dac_samples.setdefault(g, [])
+            self.dac_events.append(DACEvent(self._dac_start, self._dac_seq[-1], g))
+            self._dac_seq = []
 
     def analyze_instruments(self, data: bytes, header: Dict) -> Tuple[Dict[str, List[NoteEvent]], Dict[str, List[DACEvent]]]:
-        """Analyze VGM data to discover instruments and DAC samples"""
-        pos = header['data_start']
-        self.current_time = 0
-        
+        pos = header['data_start']; self.current_time = 0
         print("Analyzing instruments and DAC samples...")
-        
         while pos < len(data):
-            if pos + 1 > len(data):
-                break
-                
             cmd = data[pos]
-            
-            if cmd == 0x66:  # End of data
-                break
-            elif cmd == 0x52:  # YM2612 port 0 write
-                if pos + 2 >= len(data):
-                    break
-                reg, value = data[pos + 1], data[pos + 2]
-                
-                if reg == 0x28:  # Key on/off
-                    self.handle_key_onoff(value)
+            if   cmd == 0x66: break
+            elif cmd == 0x52 and pos+2 < len(data):
+                r,v = data[pos+1], data[pos+2]
+                if   r==0x28: self.handle_key_onoff(v)
                 else:
-                    channel = self.get_channel_from_port_reg(0x52, reg)
-                    if channel is not None:
-                        self.update_instrument_state(channel, reg, value, 0x52)
-                
-                pos += 3
-            elif cmd == 0x53:  # YM2612 port 1 write
-                if pos + 2 >= len(data):
-                    break
-                reg, value = data[pos + 1], data[pos + 2]
-                
-                if reg == 0x28:  # Key on/off
-                    self.handle_key_onoff(value)
-                elif reg == 0x2A:  # DAC enable/disable
-                    self.dac_enabled = (value & 0x80) != 0
-                    if self.debug:
-                        print(f"DAC {'ENABLED' if self.dac_enabled else 'DISABLED'}")
+                    ch = self.get_channel_from_port_reg(0x52, r)
+                    if ch is not None: self.update_instrument_state(ch, r, v, 0x52)
+                pos+=3
+            elif cmd == 0x53 and pos+2 < len(data):
+                r,v = data[pos+1], data[pos+2]
+                if   r==0x28: self.handle_key_onoff(v)
+                elif r==0x2A:
+                    self.dac_enabled = (v & 0x80)!=0
+                    if self.debug: print(f"DAC {'EN' if self.dac_enabled else 'DIS'}")
                 else:
-                    channel = self.get_channel_from_port_reg(0x53, reg)
-                    if channel is not None:
-                        self.update_instrument_state(channel, reg, value, 0x53)
-                
-                pos += 3
-            elif cmd == 0x2A:  # DAC data write
-                if pos + 1 >= len(data):
-                    break
-                value = data[pos + 1]
-                self.handle_dac_sample(value)
-                pos += 2
-            elif cmd & 0xF0 == 0x80:  # DAC write + wait (0x8n)
-                value = cmd & 0x0F
-                self.handle_dac_sample(value)
-                self.current_time += 1
-                pos += 1
-            elif cmd == 0x61:  # Wait n samples
-                if pos + 2 >= len(data):
-                    break
-                wait_time = struct.unpack('<H', data[pos + 1:pos + 3])[0]
-                self.current_time += wait_time
-                # Finalize any DAC sequence on wait
-                self.finalize_dac_sequence()
-                pos += 3
-            elif cmd == 0x62:  # Wait 735 samples
-                self.current_time += 735
-                self.finalize_dac_sequence()
-                pos += 1
-            elif cmd == 0x63:  # Wait 882 samples
-                self.current_time += 882
-                self.finalize_dac_sequence()
-                pos += 1
-            elif cmd & 0xF0 == 0x70:  # Wait 1-16 samples
-                self.current_time += (cmd & 0x0F) + 1
-                self.finalize_dac_sequence()
-                pos += 1
+                    ch = self.get_channel_from_port_reg(0x53, r)
+                    if ch is not None: self.update_instrument_state(ch, r, v, 0x53)
+                pos+=3
+            elif cmd == 0x2A and pos+1 < len(data):
+                self.handle_dac_sample(data[pos+1]); pos+=2
+            elif cmd & 0xF0 == 0x80:
+                self.handle_dac_sample(cmd&0x0F); self.current_time+=1; pos+=1
+            elif cmd == 0x61 and pos+2 < len(data):
+                wt = struct.unpack('<H', data[pos+1:pos+3])[0]
+                self.current_time += wt; self.finalize_dac_sequence(); pos+=3
+            elif cmd == 0x62:
+                self.current_time += 735; self.finalize_dac_sequence(); pos+=1
+            elif cmd == 0x63:
+                self.current_time += 882; self.finalize_dac_sequence(); pos+=1
+            elif cmd & 0xF0 == 0x70:
+                self.current_time += (cmd&0x0F)+1; self.finalize_dac_sequence(); pos+=1
             else:
-                # Unknown command, skip
-                if self.debug:
-                    print(f"Unknown command: 0x{cmd:02X} at pos {pos}")
-                pos += 1
-        
-        # Finalize any remaining DAC sequence
+                if self.debug: print(f"Skip cmd 0x{cmd:02X} @ {pos}")
+                pos+=1
         self.finalize_dac_sequence()
-        
-        # Group note events by instrument
-        instrument_events = defaultdict(list)
-        for event in self.note_events:
-            instrument_events[event.instrument_hash].append(event)
-        
-        # Group DAC events by sample type
+
+        inst_events = defaultdict(list)
+        for e in self.note_events: inst_events[e.instrument_hash].append(e)
         dac_events = defaultdict(list)
-        for event in self.dac_events:
-            dac_events[event.sample_group].append(event)
-        
-        print(f"Discovered {len(self.discovered_instruments)} unique FM instruments")
-        print(f"Discovered {len(self.discovered_dac_samples)} unique DAC sample groups")
-        print(f"Recorded {len(self.note_events)} FM note events")
-        print(f"Recorded {len(self.dac_events)} DAC events")
-        
-        return dict(instrument_events), dict(dac_events)
+        for e in self.dac_events:    dac_events[e.sample_group].append(e)
+
+        print(f"Discovered {len(self.discovered_instruments)} FM inst, {len(self.discovered_dac_samples)} DAC groups")
+        print(f"Recorded {len(self.note_events)} note evts, {len(self.dac_events)} DAC evts")
+        return dict(inst_events), dict(dac_events)
 
     def create_vgm_file(self, original_data: bytes, processed_data: bytes, output_path: str):
-        """Create a new VGM file with processed data"""
-        # Copy original header
         header_data = bytearray(original_data[:64])
-        
-        # Update data offset in header
-        data_offset = len(header_data) - 52
-        struct.pack_into('<I', header_data, 52, data_offset)
-        
+        struct.pack_into('<I', header_data, 52, len(header_data)-52)
         with open(output_path, 'wb') as f:
             f.write(header_data)
             f.write(processed_data)
 
-    def create_instrument_vgm(self, original_data: bytes, header: Dict, 
-                            instrument_hash: str, events: List[NoteEvent], 
-                            output_path: str):
-        """Create a VGM file containing only the specified instrument"""
-        pos = header['data_start']
-        output_data = bytearray()
-        current_time = 0
-        active_notes = set()  # Track which channels have active notes for this instrument
-        
-        # Get the instrument definition
-        instrument = self.discovered_instruments[instrument_hash]
-        
-        print(f"Creating VGM for instrument {instrument_hash}...")
-        
-        # Create event lookup for quick access
-        events_by_time = defaultdict(list)
-        for event in events:
-            events_by_time[event.time].append(event)
-        
-        # Add initial instrument setup for all channels
-        for channel in range(6):
-            # Write instrument registers
-            for op, regs in instrument.operators.items():
-                for base_reg, value in regs.items():
-                    actual_reg = base_reg | (op << 2)
-                    if channel < 3:
-                        output_data.extend([0x52, actual_reg | channel, value])
-                    else:
-                        output_data.extend([0x53, actual_reg | (channel - 3), value])
-            
-            # Write channel registers
-            for reg, value in instrument.channel_regs.items():
-                if channel < 3:
-                    output_data.extend([0x52, reg | channel, value])
-                else:
-                    output_data.extend([0x53, reg | (channel - 3), value])
-        
+    def create_instrument_vgm(self, original_data: bytes, header: Dict,
+                              instrument_hash: str, events: List[NoteEvent],
+                              output_path: str):
+        pos = header['data_start']; out = bytearray(); t = 0; active = set()
+        inst = self.discovered_instruments[instrument_hash]
+        print(f"Creating VGM for inst {instrument_hash}...")
+        # initial reg dumps
+        for ch in range(6):
+            for op, regs in inst.operators.items():
+                for br,val in regs.items():
+                    reg = br | (op<<2)
+                    out.extend([0x52 if ch<3 else 0x53, reg, val])
+            for r,v in inst.channel_regs.items():
+                out.extend([0x52 if ch<3 else 0x53, r, v])
+        ev_by_t = defaultdict(list)
+        for e in events: ev_by_t[e.time].append(e)
+
         while pos < len(original_data):
-            if pos + 1 > len(original_data):
-                break
-                
             cmd = original_data[pos]
-            
-            # Check if we have events at current time
-            current_events = events_by_time.get(current_time, [])
-            
-            if cmd == 0x66:  # End of data
-                output_data.append(cmd)
-                break
-            elif cmd == 0x52:  # YM2612 port 0 write
-                if pos + 2 >= len(original_data):
-                    break
-                reg, value = original_data[pos + 1], original_data[pos + 2]
-                
-                include_command = False
-                
-                if reg == 0x28:  # Key on/off
-                    # Only include if it's for our instrument
-                    raw_channel = value & 0x07
-                    if raw_channel <= 2:
-                        channel = raw_channel
-                    elif raw_channel >= 4 and raw_channel <= 6:
-                        channel = raw_channel - 1
-                    else:
-                        channel = -1
-                    
-                    for event in current_events:
-                        if event.channel == channel and event.instrument_hash == instrument_hash:
-                            include_command = True
-                            if event.note_on:
-                                active_notes.add(event.channel)
-                            else:
-                                active_notes.discard(event.channel)
+            if cmd == 0x66:
+                out.append(cmd); break
+            cur = ev_by_t.get(t, [])
+            if cmd in (0x52, 0x53) and pos+2< len(original_data):
+                r,v = original_data[pos+1], original_data[pos+2]
+                inc = False
+                if r==0x28:
+                    raw = v&0x07
+                    ch  = raw if raw<=2 else raw-1
+                    for e in cur:
+                        if e.channel==ch and e.instrument_hash==instrument_hash:
+                            inc = True
+                            if e.note_on: active.add(ch)
+                            else: active.discard(ch)
                             break
                 else:
-                    # Include register writes for channels that have active notes
-                    channel = self.get_channel_from_port_reg(0x52, reg)
-                    if channel in active_notes:
-                        include_command = True
-                
-                if include_command:
-                    output_data.extend([cmd, reg, value])
-                
-                pos += 3
-            elif cmd == 0x53:  # YM2612 port 1 write
-                if pos + 2 >= len(original_data):
-                    break
-                reg, value = original_data[pos + 1], original_data[pos + 2]
-                
-                include_command = False
-                
-                if reg == 0x28:  # Key on/off
-                    raw_channel = value & 0x07
-                    if raw_channel <= 2:
-                        channel = raw_channel
-                    elif raw_channel >= 4 and raw_channel <= 6:
-                        channel = raw_channel - 1
-                    else:
-                        channel = -1
-                    
-                    for event in current_events:
-                        if event.channel == channel and event.instrument_hash == instrument_hash:
-                            include_command = True
-                            if event.note_on:
-                                active_notes.add(event.channel)
-                            else:
-                                active_notes.discard(event.channel)
-                            break
-                else:
-                    channel = self.get_channel_from_port_reg(0x53, reg)
-                    if channel in active_notes:
-                        include_command = True
-                
-                if include_command:
-                    output_data.extend([cmd, reg, value])
-                
-                pos += 3
-            elif cmd == 0x61:  # Wait n samples
-                if pos + 2 >= len(original_data):
-                    break
-                wait_time = struct.unpack('<H', original_data[pos + 1:pos + 3])[0]
-                current_time += wait_time
-                output_data.extend([cmd, original_data[pos + 1], original_data[pos + 2]])
-                pos += 3
-            elif cmd in [0x62, 0x63] or (cmd & 0xF0 == 0x70):
-                # Wait commands
-                if cmd == 0x62:
-                    current_time += 735
-                elif cmd == 0x63:
-                    current_time += 882
-                else:
-                    current_time += (cmd & 0x0F) + 1
-                output_data.append(cmd)
-                pos += 1
+                    ch = self.get_channel_from_port_reg(cmd, r)
+                    if ch in active: inc=True
+                if inc: out.extend([cmd,r,v])
+                pos+=3
+            elif cmd==0x61 and pos+2< len(original_data):
+                wt=struct.unpack('<H', original_data[pos+1:pos+3])[0]
+                t+=wt; out.extend([cmd, original_data[pos+1], original_data[pos+2]]); pos+=3
+            elif cmd in (0x62,0x63) or (cmd&0xF0)==0x70:
+                if cmd==0x62: t+=735
+                elif cmd==0x63: t+=882
+                else: t+=(cmd&0x0F)+1
+                out.append(cmd); pos+=1
             else:
-                pos += 1
-        
-        # Create the VGM file
-        self.create_vgm_file(original_data, bytes(output_data), output_path)
+                pos+=1
 
-    def create_dac_vgm(self, original_data: bytes, header: Dict, 
-                      sample_group: str, events: List[DACEvent], 
-                      output_path: str):
-        """Create a VGM file containing only the specified DAC sample group"""
-        pos = header['data_start']
-        output_data = bytearray()
-        current_time = 0
-        
-        print(f"Creating VGM for DAC sample group {sample_group}...")
-        
-        # Create event lookup for quick access
-        events_by_time = defaultdict(list)
-        for event in events:
-            events_by_time[event.time].append(event)
-        
+        self.create_vgm_file(original_data, bytes(out), output_path)
+
+    def create_dac_vgm(self, original_data: bytes, header: Dict,
+                       sample_group: str, events: List[DACEvent],
+                       output_path: str):
+        pos = header['data_start']; out=bytearray(); t=0
+        print(f"Creating VGM for DAC group {sample_group}...")
+        ev_by_t = defaultdict(list)
+        for e in events: ev_by_t[e.time].append(e)
+
         while pos < len(original_data):
-            if pos + 1 > len(original_data):
-                break
-                
             cmd = original_data[pos]
-            
-            # Check if we have DAC events at current time
-            current_events = events_by_time.get(current_time, [])
-            
-            if cmd == 0x66:  # End of data
-                output_data.append(cmd)
-                break
-            elif cmd == 0x53 and pos + 2 < len(original_data):
-                reg, value = original_data[pos + 1], original_data[pos + 2]
-                if reg == 0x2A:  # DAC enable/disable - always include
-                    output_data.extend([cmd, reg, value])
-                pos += 3
-            elif cmd == 0x2A:  # DAC data write
-                if pos + 1 >= len(original_data):
-                    break
-                value = original_data[pos + 1]
-                
-                # Include if this sample belongs to our group
-                include_sample = False
-                for event in current_events:
-                    if event.sample_group == sample_group:
-                        include_sample = True
-                        break
-                
-                if include_sample:
-                    output_data.extend([cmd, value])
-                
-                pos += 2
-            elif cmd & 0xF0 == 0x80:  # DAC write + wait
-                # Check if this DAC sample belongs to our group
-                include_sample = False
-                for event in current_events:
-                    if event.sample_group == sample_group:
-                        include_sample = True
-                        break
-                
-                if include_sample:
-                    output_data.append(cmd)
+            if cmd==0x66:
+                out.append(cmd); break
+            cur = ev_by_t.get(t, [])
+            if cmd==0x53 and pos+2< len(original_data):
+                r,v=original_data[pos+1],original_data[pos+2]
+                if r==0x2A: out.extend([cmd,r,v])
+                pos+=3
+            elif cmd==0x2A and pos+1< len(original_data):
+                v=original_data[pos+1]
+                if any(e.sample_group==sample_group for e in cur):
+                    out.extend([cmd,v])
+                pos+=2
+            elif (cmd&0xF0)==0x80:
+                inc = any(e.sample_group==sample_group for e in cur)
+                if inc: out.append(cmd)
                 else:
-                    # Convert to regular wait if DAC not included
-                    wait_time = cmd & 0x0F
-                    if wait_time == 0:
-                        output_data.extend([0x61, 0x01, 0x00])  # Wait 1 sample
-                    else:
-                        output_data.append(0x70 + wait_time - 1)
-                
-                current_time += 1
-                pos += 1
-            elif cmd == 0x61:  # Wait n samples
-                if pos + 2 >= len(original_data):
-                    break
-                wait_time = struct.unpack('<H', original_data[pos + 1:pos + 3])[0]
-                current_time += wait_time
-                output_data.extend([cmd, original_data[pos + 1], original_data[pos + 2]])
-                pos += 3
-            elif cmd in [0x62, 0x63] or (cmd & 0xF0 == 0x70):
-                # Other wait commands
-                if cmd == 0x62:
-                    current_time += 735
-                elif cmd == 0x63:
-                    current_time += 882
-                else:
-                    current_time += (cmd & 0x0F) + 1
-                output_data.append(cmd)
-                pos += 1
+                    wt=cmd&0x0F
+                    out.extend([0x61, wt or 1, 0x00] if wt==0 else [0x70+wt-1])
+                t+=1; pos+=1
+            elif cmd==0x61 and pos+2< len(original_data):
+                wt=struct.unpack('<H', original_data[pos+1:pos+3])[0]
+                t+=wt; out.extend([cmd, original_data[pos+1], original_data[pos+2]]); pos+=3
+            elif cmd in (0x62,0x63) or (cmd&0xF0)==0x70:
+                if cmd==0x62: t+=735
+                elif cmd==0x63: t+=882
+                else: t+=(cmd&0x0F)+1
+                out.append(cmd); pos+=1
             else:
-                # Skip other commands for DAC-only file
-                pos += 1
-        
-        # Create the VGM file
-        self.create_vgm_file(original_data, bytes(output_data), output_path)
+                pos+=1
 
-    def isolate_instruments(self, input_file: str, output_dir: str):
-        """Create isolated files for each discovered instrument"""
+        self.create_vgm_file(original_data, bytes(out), output_path)
+
+    def create_summary_report(self, output_dir: str, base_name: str,
+                              instrument_events: Dict[str, List], dac_events: Dict[str, List]):
+        """Create a summary report of discovered instruments and samples"""
+        summary_file = os.path.join(output_dir, f"{base_name}_summary.txt")
+        with open(summary_file, 'w') as f:
+            f.write("VGM Instrument Isolation Summary\n")
+            f.write("="*50 + "\n")
+            f.write(f"Source file: {base_name}\n\n")
+            f.write(f"FM Instruments Found: {len(instrument_events)}\n")
+            f.write("-"*30 + "\n")
+            for i,(h,evs) in enumerate(instrument_events.items()):
+                inst = self.discovered_instruments[h]
+                note_ct = len([e for e in evs if e.note_on])
+                f.write(f"Instrument {i+1:02d} ({h}):\n")
+                f.write(f"  - Note events: {note_ct}\n")
+                f.write(f"  - Operators: {len(inst.operators)}\n")
+                f.write(f"  - Channel regs: {len(inst.channel_regs)}\n")
+                if inst.channel_regs.get(0xB0):
+                    fb_alg=inst.channel_regs[0xB0]
+                    f.write(f"  - Algorithm: {fb_alg&0x07}, Feedback: {(fb_alg>>3)&0x07}\n")
+                f.write("\n")
+            f.write(f"DAC Sample Groups Found: {len(dac_events)}\n")
+            f.write("-"*30 + "\n")
+            for i,(g,evs) in enumerate(dac_events.items()):
+                f.write(f"DAC Group {i+1:02d} ({g}):\n")
+                f.write(f"  - Events: {len(evs)}\n")
+                if evs:
+                    vals = [e.sample_value for e in evs[:10]]
+                    f.write(f"  - Sample values: {vals}\n")
+                f.write("\n")
+        print(f"Summary report saved to: {summary_file}")
+
+    def isolate_instruments_complete(self, input_file: str, output_dir: str):
+        """Complete version of isolate_instruments with summary report"""
         if not os.path.exists(input_file):
             raise FileNotFoundError(f"Input file not found: {input_file}")
-        
         os.makedirs(output_dir, exist_ok=True)
-        
         with open(input_file, 'rb') as f:
-            original_data = f.read()
-        
-        header = self.read_vgm_header(original_data)
-        base_name = os.path.splitext(os.path.basename(input_file))[0]
-        
+            data = f.read()
+        header = self.read_vgm_header(data)
+        base = os.path.splitext(os.path.basename(input_file))[0]
         print(f"Processing {input_file}...")
-        
-        # Analyze the file to discover instruments and DAC samples
-        instrument_events, dac_events = self.analyze_instruments(original_data, header)
-        
-        if not instrument_events and not dac_events:
-            print("No instruments or DAC samples found!")
-            return
-        
-        # Create a file for each FM instrument
-        for i, (inst_hash, events) in enumerate(instrument_events.items()):
-            instrument = self.discovered_instruments[inst_hash]
-            note_count = len([e for e in events if e.note_on])
-            
-            print(f"FM Instrument {i+1:02d} ({inst_hash}): {note_count} notes")
-            
-            output_file = os.path.join(output_dir, f"{base_name}_fm_inst_{i+1:02d}_{inst_hash}.vgm")
-            self.create_instrument_vgm(original_data, header, inst_hash, events, output_file)
-        
-        # Create a file for each DAC sample group
-        for i, (sample_group, events) in enumerate(dac_events.items()):
-            event_count = len(events)
-            
-            print(f"DAC Sample {i+1:02d} ({sample_group}): {event_count} events")
-            
-            output_file = os.path.join(output_dir, f"{base_name}_dac_{i+1:02d}_{sample_group}.vgm")
-            self.create_dac_vgm(original_data, header, sample_group, events, output_file)
-        
-        # Create summary file
+        inst_ev, dac_ev = self.analyze_instruments(data, header)
+        if not inst_ev and not dac_ev:
+            print("No instruments or DAC samples found!"); return
+        for i,(h,evs) in enumerate(inst_ev.items()):
+            out = os.path.join(output_dir, f"{base}_fm_inst_{i+1:02d}_{h}.vgm")
+            self.create_instrument_vgm(data, header, h, evs, out)
+        for i,(g,evs) in enumerate(dac_ev.items()):
+            out = os.path.join(output_dir, f"{base}_dac_{i+1:02d}_{g}.vgm")
+            self.create_dac_vgm(data, header, g, evs, out)
+        self.create_summary_report(output_dir, base, inst_ev, dac_ev)
+        print("\nProcessing complete!")
+        print(f"Files in: {output_dir} - {len(inst_ev)} FM files, {len(dac_ev)} DAC files, 1 summary")
+
+def main():
+    """Main function to process VGM files"""
+    if len(sys.argv) < 2:
+        print("Usage: python vgm_isolator_fixed.py <input_vgm_file> [output_directory]")
+        sys.exit(1)
+    inp = sys.argv[1]
+    outd = sys.argv[2] if len(sys.argv) > 2 else "./isolated_instruments"
+    try:
+        proc = VGMInstrumentProcessor()
+        proc.isolate_instruments_complete(inp, outd)
+    except Exception as e:
+        print(f"Error processing VGM file: {e}")
+        import traceback; traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
